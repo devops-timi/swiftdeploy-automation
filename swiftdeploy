@@ -7,6 +7,7 @@ COMPOSE_TEMPLATE="templates/docker-compose.yml.tmpl"
 NGINX_OUT="nginx.conf"
 COMPOSE_OUT="docker-compose.yml"
 
+# Helper to read manifest fields using inline Python
 get_val() {
     python3 -c "
 import yaml
@@ -15,18 +16,21 @@ try:
         data = yaml.safe_load(f)
     keys = '$1'.split('.')
     val = data
-    for k in keys: val = val[k]
+    for k in keys:
+        val = val[k]
     print(val if val is not None else '')
 except:
     print('')
 "
 }
 
+# Helper to check if a port is in use
 port_in_use() {
     local port=$1
     nc -z -w1 127.0.0.1 "$port" >/dev/null 2>&1 || lsof -i:"$port" >/dev/null 2>&1
 }
 
+# Python-driven template parsing to completely avoid shell variable substitution issues
 cmd_init() {
     echo "── swiftdeploy init ──────────────────────────────────"
     if [ ! -f "$MANIFEST_FILE" ]; then
@@ -34,44 +38,63 @@ cmd_init() {
         exit 1
     fi
 
-    IMAGE=$(get_val "services.image")
-    APP_PORT=$(get_val "services.port")
-    MODE=$(get_val "services.mode")
-    VERSION=$(get_val "services.version")
-    RESTART=$(get_val "services.restart")
-    NGINX_IMAGE=$(get_val "nginx.image")
-    NGINX_PORT=$(get_val "nginx.port")
-    PROXY_TIMEOUT=$(get_val "nginx.proxy_timeout")
-    NETWORK_NAME=$(get_val "network.name")
-    NETWORK_DRIVER=$(get_val "network.driver_type")
-    CONTACT=$(get_val "contact")
+    # Render template files safely using inline Python
+    python3 -c "
+import yaml
 
-    [ -z "$MODE" ] && MODE="stable"
-    [ -z "$VERSION" ] && VERSION="1.0.0"
-    [ -z "$RESTART" ] && RESTART="unless-stopped"
-    [ -z "$PROXY_TIMEOUT" ] && PROXY_TIMEOUT="30"
-    [ -z "$CONTACT" ] && CONTACT="admin@swiftdeploy.local"
+with open('$MANIFEST_FILE', 'r') as f:
+    cfg = yaml.safe_load(f)
 
-    sed -e "s|{{NGINX_PORT}}|$NGINX_PORT|g" \
-        -e "s|{{PROXY_TIMEOUT}}|$PROXY_TIMEOUT|g" \
-        -e "s|{{APP_PORT}}|$APP_PORT|g" \
-        -e "s|{{CONTACT}}|$CONTACT|g" \
-        "$NGINX_TEMPLATE" > "$NGINX_OUT"
+# Extraction and safe fallback defaults
+services = cfg.get('services', {})
+nginx = cfg.get('nginx', {})
+network = cfg.get('network', {})
 
-    echo "  ✓ Generated $NGINX_OUT"
+image = services.get('image', '')
+app_port = str(services.get('port', ''))
+mode = services.get('mode', 'stable')
+version = services.get('version', '1.0.0')
+restart = services.get('restart', 'unless-stopped')
 
-    sed -e "s|{{IMAGE}}|$IMAGE|g" \
-        -e "s|{{MODE}}|$MODE|g" \
-        -e "s|{{APP_VERSION}}|$VERSION|g" \
-        -e "s|{{APP_PORT}}|$APP_PORT|g" \
-        -e "s|{{NGINX_IMAGE}}|$NGINX_IMAGE|g" \
-        -e "s|{{NGINX_PORT}}|$NGINX_PORT|g" \
-        -e "s|{{NETWORK_NAME}}|$NETWORK_NAME|g" \
-        -e "s|{{NETWORK_DRIVER}}|$NETWORK_DRIVER|g" \
-        -e "s|{{RESTART_POLICY}}|$RESTART|g" \
-        "$COMPOSE_TEMPLATE" > "$COMPOSE_OUT"
+nginx_image = nginx.get('image', 'nginx:latest')
+nginx_port = str(nginx.get('port', ''))
+proxy_timeout = str(nginx.get('proxy_timeout', '30'))
 
-    echo "  ✓ Generated $COMPOSE_OUT"
+net_name = network.get('name', '')
+net_driver = network.get('driver_type', 'bridge')
+contact = cfg.get('contact', 'admin@swiftdeploy.local')
+
+# Process Nginx Template safely
+with open('$NGINX_TEMPLATE', 'r') as f:
+    nginx_conf = f.read()
+
+nginx_conf = nginx_conf.replace('{{NGINX_PORT}}', nginx_port) \\
+                       .replace('{{PROXY_TIMEOUT}}', proxy_timeout) \\
+                       .replace('{{APP_PORT}}', app_port) \\
+                       .replace('{{CONTACT}}', contact)
+
+with open('$NGINX_OUT', 'w') as f:
+    f.write(nginx_conf)
+
+# Process Docker Compose Template safely
+with open('$COMPOSE_TEMPLATE', 'r') as f:
+    compose = f.read()
+
+compose = compose.replace('{{IMAGE}}', image) \\
+                 .replace('{{MODE}}', mode) \\
+                 .replace('{{APP_VERSION}}', version) \\
+                 .replace('{{APP_PORT}}', app_port) \\
+                 .replace('{{NGINX_IMAGE}}', nginx_image) \\
+                 .replace('{{NGINX_PORT}}', nginx_port) \\
+                 .replace('{{NETWORK_NAME}}', net_name) \\
+                 .replace('{{NETWORK_DRIVER}}', net_driver) \\
+                 .replace('{{RESTART_POLICY}}', restart)
+
+with open('$COMPOSE_OUT', 'w') as f:
+    f.write(compose)
+
+print('  ✓ Generated nginx.conf and docker-compose.yml successfully via Python string replacement.')
+"
     echo "── init complete ─────────────────────────────────────"
 }
 
@@ -79,7 +102,7 @@ cmd_validate() {
     echo "── swiftdeploy validate ──────────────────────────────"
     local all_passed=true
 
-    # 1. Manifest existence and validity
+    # 1. YAML validation check
     echo -e "\n[1/5] Checking manifest.yaml exists and is valid YAML..."
     if [ -f "$MANIFEST_FILE" ]; then
         if python3 -c "import yaml; yaml.safe_load(open('$MANIFEST_FILE'))" >/dev/null 2>&1; then
@@ -93,7 +116,7 @@ cmd_validate() {
         all_passed=false
     fi
 
-    # 2. Required fields
+    # 2. Field existence check
     echo -e "\n[2/5] Checking required fields..."
     local required=("services.image" "services.port" "nginx.image" "nginx.port" "network.name" "network.driver_type")
     for field in "${required[@]}"; do
@@ -130,10 +153,11 @@ cmd_validate() {
     cmd_init > /dev/null
     local nginx_image=$(get_val "nginx.image")
     [ -z "$nginx_image" ] && nginx_image="nginx:latest"
+
     if docker run --rm -v "$(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t >/dev/null 2>&1; then
         echo "  ✅ PASS: nginx.conf is syntactically valid"
     else
-        echo "  ❌ FAIL: nginx.conf syntax error"
+        echo "  ❌ FAIL: nginx.conf syntax error detected"
         all_passed=false
     fi
 
@@ -148,7 +172,7 @@ cmd_deploy() {
     cmd_init >/dev/null
     cmd_validate
     echo -e "\n── swiftdeploy deploy ────────────────────────────────"
-    echo "Bringing up the stack..."
+    echo "Bringing up the stack via Docker Compose..."
     docker compose up -d
 
     local port=$(get_val "nginx.port")
@@ -183,7 +207,7 @@ with open('$MANIFEST_FILE', 'w') as f: yaml.dump(data, f, default_flow_style=Fal
     echo "  ✓ Updated $MANIFEST_FILE to $target_mode"
     cmd_init > /dev/null
 
-    echo "  Recreating service container..."
+    echo "  Recreating app container only..."
     docker compose up -d --no-deps app
 
     local port=$(get_val "nginx.port")
