@@ -93,7 +93,7 @@ compose = compose.replace('{{IMAGE}}', image) \\
 with open('$COMPOSE_OUT', 'w') as f:
     f.write(compose)
 
-print('  ✓ Generated nginx.conf and docker-compose.yml successfully via Python string replacement.')
+print('  ✓ Generated nginx.conf and docker-compose.yml successfully.')
 "
     echo "── init complete ─────────────────────────────────────"
 }
