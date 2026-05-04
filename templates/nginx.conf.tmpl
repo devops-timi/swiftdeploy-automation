@@ -36,6 +36,7 @@ http {
             
             # Forward X-Mode header from upstream response
             proxy_pass_header X-Mode;
+            add_header X-Mode $upstream_http_x_mode always;
             
             # Add signature header
             add_header X-Deployed-By "swiftdeploy" always;
