@@ -13,12 +13,15 @@ http {
     proxy_send_timeout    {{PROXY_TIMEOUT}}s;
     proxy_read_timeout    {{PROXY_TIMEOUT}}s;
 
-    upstream app_servers {
-        server app:{{APP_PORT}};
-    }
+    
 
     server {
         listen {{NGINX_PORT}};
+
+        # Docker's internal DNS resolver — always available inside Docker networks
+        # This tells nginx to resolve hostnames at request time, not at startup
+
+        resolver 127.0.0.11 valid=10s;
 
         # Return dynamic JSON error bodies on 502, 503, 504
         error_page 502 = @err502;
@@ -26,7 +29,8 @@ http {
         error_page 504 = @err504;
 
         location / {
-            proxy_pass http://app_servers;
+            set $upstream http://app:{{APP_PORT}};
+            proxy_pass $upstream;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             
