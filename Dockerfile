@@ -33,4 +33,4 @@ USER appuser
 EXPOSE 3000
 
 # When the container starts, run main.py with Python.
-CMD ["python", "main.py"]
+CMD ["python3", "main.py"]
