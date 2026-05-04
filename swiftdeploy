@@ -210,7 +210,7 @@ with open('$MANIFEST_FILE', 'w') as f:
     cmd_init > /dev/null
 
     echo "  Recreating app container only..."
-    docker compose up -d --no-deps app
+    docker compose up -d --no-deps --force-recreate app
 
     local port=$(get_val "nginx.port")
     local url="http://localhost:$port/healthz"
