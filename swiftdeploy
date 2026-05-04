@@ -199,10 +199,12 @@ cmd_promote() {
 
     echo "── swiftdeploy promote: $target_mode ─────────────────"
     python3 -c "
-import yaml
-with open('$MANIFEST_FILE', 'r') as f: data = yaml.safe_load(f)
-data['services']['mode'] = '$target_mode'
-with open('$MANIFEST_FILE', 'w') as f: yaml.dump(data, f, default_flow_style=False)
+import re
+with open('$MANIFEST_FILE', 'r') as f:
+    content = f.read()
+content = re.sub(r'(mode:\s*)\S+', r'\g<1>$target_mode', content)
+with open('$MANIFEST_FILE', 'w') as f:
+    f.write(content)
 "
     echo "  ✓ Updated $MANIFEST_FILE to $target_mode"
     cmd_init > /dev/null
