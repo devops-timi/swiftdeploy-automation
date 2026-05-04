@@ -19,7 +19,7 @@ services:
 
     # Run as a non-root user.
     
-    user: "nobody"
+    user: "appuser"  # This user is created in our Dockerfile with adduser -D appuser
 
     # Environment variables injected into the container.
     # These are read by app/main.py using os.environ.get(...)
@@ -49,18 +49,20 @@ services:
     # Health check: Docker pings /healthz every 10 seconds.
     # If it fails 3 times in a row, Docker marks the container "unhealthy".
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:{{APP_PORT}}/healthz || exit 1"]
-      interval: 10s      # Check every 10 seconds
-      timeout: 5s        # Wait max 5 seconds for a response
-      retries: 3         # Mark unhealthy after 3 failures
-      start_period: 10s  # Give the app 10 seconds to start before checking
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:{{APP_PORT}}/healthz')\" || exit 1"]
+      interval: 10s   
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   # ── Nginx service ──────────────────────────────────────────────────────
   nginx:
     image: {{NGINX_IMAGE}}     # nginx:latest from manifest.yaml → nginx.image
 
     cap_drop:
-      - ALL                    # Drop all capabilities for Nginx too
+      - NET_ADMIN    # drop capabilities nginx doesn't need
+      - SYS_ADMIN    # but keep CHOWN and SETUID which nginx requires
+      - SYS_PTRACE                    
 
     # Expose Nginx port to the host. THIS is the only port visible from outside.
     # Format: "HOST_PORT:CONTAINER_PORT"
