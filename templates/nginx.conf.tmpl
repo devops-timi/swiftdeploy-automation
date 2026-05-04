@@ -4,7 +4,7 @@ events {
 
 http {
     # Logging format matching the specific requirement
-    log_format swiftdeploy '$time_iso8601 | $status | $request_time''s | $upstream_addr | $request';
+    log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
     access_log /var/log/nginx/access.log swiftdeploy;
     access_log /dev/stdout swiftdeploy;
 
