@@ -1,0 +1,100 @@
+# templates/docker-compose.yml.tmpl
+# Template for docker-compose.yml.
+# Placeholders like {{IMAGE}} are replaced by swiftdeploy init.
+
+# "name" sets the Docker Compose project name.
+# All containers, networks, and volumes will be prefixed with this.
+name: swiftdeploy
+
+services:
+
+  # ── App service ─────────────────────────────────────────────────────────
+  app:
+    image: {{IMAGE}}               # Docker image name from manifest.yaml → services.image
+
+    # Security: drop ALL Linux capabilities.
+    
+    cap_drop:
+      - ALL
+
+    # Run as a non-root user.
+    
+    user: "nobody"
+
+    # Environment variables injected into the container.
+    # These are read by app/main.py using os.environ.get(...)
+
+    environment:
+      MODE: "{{MODE}}"                # "stable" or "canary" from manifest.yaml
+      APP_VERSION: "{{APP_VERSION}}"  # Version string
+      APP_PORT: "{{APP_PORT}}"        # Port the app listens on (3000)
+
+    # Mount a named volume for logs.
+    # Logs written to /app/logs inside the container persist here.
+
+    volumes:
+      - swiftdeploy-logs:/app/logs
+
+    # Use the network defined in manifest.yaml → network.name
+    networks:
+      - {{NETWORK_NAME}}
+
+    # Restart the container automatically if it crashes.
+    # "unless-stopped" = restart always, unless you manually stop it.
+    restart: {{RESTART_POLICY}}
+
+    # IMPORTANT: We do NOT expose the app port to the host.
+    # All traffic must go through Nginx. No "ports:" section here.
+
+    # Health check: Docker pings /healthz every 10 seconds.
+    # If it fails 3 times in a row, Docker marks the container "unhealthy".
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:{{APP_PORT}}/healthz || exit 1"]
+      interval: 10s      # Check every 10 seconds
+      timeout: 5s        # Wait max 5 seconds for a response
+      retries: 3         # Mark unhealthy after 3 failures
+      start_period: 10s  # Give the app 10 seconds to start before checking
+
+  # ── Nginx service ──────────────────────────────────────────────────────
+  nginx:
+    image: {{NGINX_IMAGE}}     # nginx:latest from manifest.yaml → nginx.image
+
+    cap_drop:
+      - ALL                    # Drop all capabilities for Nginx too
+
+    # Expose Nginx port to the host. THIS is the only port visible from outside.
+    # Format: "HOST_PORT:CONTAINER_PORT"
+
+    ports:
+      - "{{NGINX_PORT}}:{{NGINX_PORT}}"
+
+    # Mount our generated nginx.conf into the container.
+    # ":ro" = read-only. Nginx only needs to read it, not write it.
+
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      
+
+    networks:
+      - {{NETWORK_NAME}}
+
+    restart: {{RESTART_POLICY}}
+
+    # Nginx depends on the app being healthy before it starts routing traffic.
+
+    depends_on:
+      app:
+        condition: service_healthy   # Wait for app's healthcheck to pass
+
+
+# Volumes persist data even when containers are removed.
+
+volumes:
+  swiftdeploy-logs:
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# This creates the internal Docker network that both containers join.
+
+networks:
+  {{NETWORK_NAME}}:
+    driver: {{NETWORK_DRIVER}}

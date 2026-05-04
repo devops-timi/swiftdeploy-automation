@@ -1,0 +1,22 @@
+# manifest.yaml
+# This is the ONLY file allowed to be manually edited.
+# Every other config file (nginx.conf, docker-compose.yml) is auto-generated from this.
+
+services:
+  image: swift-deploy-1-node:latest   # The Docker image name for your app
+  port: 3000                          # The port your app listens on INSIDE the container
+  mode: stable                        # Deployment mode: "stable" or "canary"
+  version: "1.0.0"                    # App version, injected as APP_VERSION env var
+  restart: unless-stopped             # Docker restart policy
+
+nginx:
+  image: nginx:latest                 # The official Nginx Docker image
+  port: 8080                          # The port Nginx exposes to the OUTSIDE world
+  proxy_timeout: 30                   # How many seconds Nginx waits before giving up
+  
+
+network:
+  name: swiftdeploy-net               # Name of the internal Docker network
+  driver_type: bridge                 # Network type: bridge = standard internal network
+
+contact: "admin@swiftdeploy.local"    # Used in JSON error responses from Nginx

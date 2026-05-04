@@ -1,0 +1,60 @@
+events {
+    worker_connections 1024;
+}
+
+http {
+    # Logging format matching the specific requirement
+    log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+    access_log /var/log/nginx/access.log swiftdeploy;
+    access_log /dev/stdout swiftdeploy;
+
+    # Timeouts set programmatically
+    proxy_connect_timeout {{PROXY_TIMEOUT}}s;
+    proxy_send_timeout    {{PROXY_TIMEOUT}}s;
+    proxy_read_timeout    {{PROXY_TIMEOUT}}s;
+
+    upstream app_servers {
+        server app:{{APP_PORT}};
+    }
+
+    server {
+        listen {{NGINX_PORT}};
+
+        # Return dynamic JSON error bodies on 502, 503, 504
+        error_page 502 = @err502;
+        error_page 503 = @err503;
+        error_page 504 = @err504;
+
+        location / {
+            proxy_pass http://app_servers;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            
+            # Forward X-Mode header from upstream response
+            proxy_pass_header X-Mode;
+            
+            # Add signature header
+            add_header X-Deployed-By "swiftdeploy" always;
+
+            proxy_intercept_errors on;
+        }
+
+        location @err502 {
+            default_type application/json;
+            add_header X-Deployed-By "swiftdeploy" always;
+            return 502 '{"error": "Bad Gateway", "code": 502, "service": "swiftdeploy-api", "contact": "{{CONTACT}}"}';
+        }
+
+        location @err503 {
+            default_type application/json;
+            add_header X-Deployed-By "swiftdeploy" always;
+            return 503 '{"error": "Service Unavailable", "code": 503, "service": "swiftdeploy-api", "contact": "{{CONTACT}}"}';
+        }
+
+        location @err504 {
+            default_type application/json;
+            add_header X-Deployed-By "swiftdeploy" always;
+            return 504 '{"error": "Gateway Timeout", "code": 504, "service": "swiftdeploy-api", "contact": "{{CONTACT}}"}';
+        }
+    }
+}

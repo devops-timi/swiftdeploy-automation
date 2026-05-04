@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -e
+
+MANIFEST_FILE="manifest.yaml"
+NGINX_TEMPLATE="templates/nginx.conf.tmpl"
+COMPOSE_TEMPLATE="templates/docker-compose.yml.tmpl"
+NGINX_OUT="nginx.conf"
+COMPOSE_OUT="docker-compose.yml"
+
+get_val() {
+    python3 -c "
+import yaml
+try:
+    with open('$MANIFEST_FILE', 'r') as f:
+        data = yaml.safe_load(f)
+    keys = '$1'.split('.')
+    val = data
+    for k in keys: val = val[k]
+    print(val if val is not None else '')
+except:
+    print('')
+"
+}
+
+port_in_use() {
+    local port=$1
+    nc -z -w1 127.0.0.1 "$port" >/dev/null 2>&1 || lsof -i:"$port" >/dev/null 2>&1
+}
+
+cmd_init() {
+    echo "── swiftdeploy init ──────────────────────────────────"
+    if [ ! -f "$MANIFEST_FILE" ]; then
+        echo "ERROR: $MANIFEST_FILE not found."
+        exit 1
+    fi
+
+    IMAGE=$(get_val "services.image")
+    APP_PORT=$(get_val "services.port")
+    MODE=$(get_val "services.mode")
+    VERSION=$(get_val "services.version")
+    RESTART=$(get_val "services.restart")
+    NGINX_IMAGE=$(get_val "nginx.image")
+    NGINX_PORT=$(get_val "nginx.port")
+    PROXY_TIMEOUT=$(get_val "nginx.proxy_timeout")
+    NETWORK_NAME=$(get_val "network.name")
+    NETWORK_DRIVER=$(get_val "network.driver_type")
+    CONTACT=$(get_val "contact")
+
+    [ -z "$MODE" ] && MODE="stable"
+    [ -z "$VERSION" ] && VERSION="1.0.0"
+    [ -z "$RESTART" ] && RESTART="unless-stopped"
+    [ -z "$PROXY_TIMEOUT" ] && PROXY_TIMEOUT="30"
+    [ -z "$CONTACT" ] && CONTACT="admin@swiftdeploy.local"
+
+    sed -e "s|{{NGINX_PORT}}|$NGINX_PORT|g" \
+        -e "s|{{PROXY_TIMEOUT}}|$PROXY_TIMEOUT|g" \
+        -e "s|{{APP_PORT}}|$APP_PORT|g" \
+        -e "s|{{CONTACT}}|$CONTACT|g" \
+        "$NGINX_TEMPLATE" > "$NGINX_OUT"
+
+    echo "  ✓ Generated $NGINX_OUT"
+
+    sed -e "s|{{IMAGE}}|$IMAGE|g" \
+        -e "s|{{MODE}}|$MODE|g" \
+        -e "s|{{APP_VERSION}}|$VERSION|g" \
+        -e "s|{{APP_PORT}}|$APP_PORT|g" \
+        -e "s|{{NGINX_IMAGE}}|$NGINX_IMAGE|g" \
+        -e "s|{{NGINX_PORT}}|$NGINX_PORT|g" \
+        -e "s|{{NETWORK_NAME}}|$NETWORK_NAME|g" \
+        -e "s|{{NETWORK_DRIVER}}|$NETWORK_DRIVER|g" \
+        -e "s|{{RESTART_POLICY}}|$RESTART|g" \
+        "$COMPOSE_TEMPLATE" > "$COMPOSE_OUT"
+
+    echo "  ✓ Generated $COMPOSE_OUT"
+    echo "── init complete ─────────────────────────────────────"
+}
+
+cmd_validate() {
+    echo "── swiftdeploy validate ──────────────────────────────"
+    local all_passed=true
+
+    # 1. Manifest existence and validity
+    echo -e "\n[1/5] Checking manifest.yaml exists and is valid YAML..."
+    if [ -f "$MANIFEST_FILE" ]; then
+        if python3 -c "import yaml; yaml.safe_load(open('$MANIFEST_FILE'))" >/dev/null 2>&1; then
+            echo "  ✅ PASS: manifest.yaml is valid YAML"
+        else
+            echo "  ❌ FAIL: manifest.yaml parsing error"
+            all_passed=false
+        fi
+    else
+        echo "  ❌ FAIL: manifest.yaml not found"
+        all_passed=false
+    fi
+
+    # 2. Required fields
+    echo -e "\n[2/5] Checking required fields..."
+    local required=("services.image" "services.port" "nginx.image" "nginx.port" "network.name" "network.driver_type")
+    for field in "${required[@]}"; do
+        val=$(get_val "$field")
+        if [ -z "$val" ]; then
+            echo "  ❌ FAIL: Missing required field: $field"
+            all_passed=false
+        fi
+    done
+    if [ "$all_passed" = true ]; then echo "  ✅ PASS: All required fields present"; fi
+
+    # 3. Docker image check
+    echo -e "\n[3/5] Checking Docker image exists locally..."
+    local image=$(get_val "services.image")
+    if [ -n "$image" ] && docker image inspect "$image" >/dev/null 2>&1; then
+        echo "  ✅ PASS: Image '$image' found locally"
+    else
+        echo "  ❌ FAIL: Image '$image' not found locally"
+        all_passed=false
+    fi
+
+    # 4. Port Check
+    echo -e "\n[4/5] Checking Nginx port availability..."
+    local port=$(get_val "nginx.port")
+    if [ -n "$port" ] && port_in_use "$port"; then
+        echo "  ❌ FAIL: Port $port is already bound on the host."
+        all_passed=false
+    else
+        echo "  ✅ PASS: Port $port is free on the host"
+    fi
+
+    # 5. Nginx Syntax Check
+    echo -e "\n[5/5] Validating generated nginx.conf syntax..."
+    cmd_init > /dev/null
+    local nginx_image=$(get_val "nginx.image")
+    [ -z "$nginx_image" ] && nginx_image="nginx:latest"
+    if docker run --rm -v "$(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t >/dev/null 2>&1; then
+        echo "  ✅ PASS: nginx.conf is syntactically valid"
+    else
+        echo "  ❌ FAIL: nginx.conf syntax error"
+        all_passed=false
+    fi
+
+    if [ "$all_passed" = false ]; then
+        echo -e "\n❌ VALIDATION FAILED"
+        exit 1
+    fi
+    echo -e "\n── validation complete: ALL CHECKS PASSED ────────────"
+}
+
+cmd_deploy() {
+    cmd_init >/dev/null
+    cmd_validate
+    echo -e "\n── swiftdeploy deploy ────────────────────────────────"
+    echo "Bringing up the stack..."
+    docker compose up -d
+
+    local port=$(get_val "nginx.port")
+    local url="http://localhost:$port/healthz"
+    echo "Polling health endpoint $url (up to 60 seconds)..."
+    for ((i=1; i<=60; i++)); do
+        if curl -s -f "$url" >/dev/null 2>&1; then
+            echo "  ✅ PASS: Service is online and healthy!"
+            return
+        fi
+        sleep 1
+    done
+
+    echo "  ❌ FAIL: Service failed health check within 60s timeout."
+    exit 1
+}
+
+cmd_promote() {
+    local target_mode=$1
+    if [[ "$target_mode" != "stable" && "$target_mode" != "canary" ]]; then
+        echo "ERROR: Invalid mode '$target_mode'. Use 'stable' or 'canary'"
+        exit 1
+    fi
+
+    echo "── swiftdeploy promote: $target_mode ─────────────────"
+    python3 -c "
+import yaml
+with open('$MANIFEST_FILE', 'r') as f: data = yaml.safe_load(f)
+data['services']['mode'] = '$target_mode'
+with open('$MANIFEST_FILE', 'w') as f: yaml.dump(data, f, default_flow_style=False)
+"
+    echo "  ✓ Updated $MANIFEST_FILE to $target_mode"
+    cmd_init > /dev/null
+
+    echo "  Recreating service container..."
+    docker compose up -d --no-deps app
+
+    local port=$(get_val "nginx.port")
+    local url="http://localhost:$port/healthz"
+    echo "  Confirming promotion by polling $url..."
+    for ((i=1; i<=30; i++)); do
+        local headers=$(curl -s -I "$url" || true)
+        if curl -s -f "$url" >/dev/null 2>&1; then
+            if [ "$target_mode" = "canary" ]; then
+                if [[ "$headers" == *"X-Mode: canary"* || "$headers" == *"x-mode: canary"* ]]; then
+                    echo "  ✅ PASS: Canary promotion active and verified."
+                    return
+                fi
+            else
+                if [[ "$headers" != *"X-Mode: canary"* && "$headers" != *"x-mode: canary"* ]]; then
+                    echo "  ✅ PASS: Stable promotion active and verified."
+                    return
+                fi
+            fi
+        fi
+        sleep 1
+    done
+    echo "  ❌ FAIL: Promotion verification timed out."
+    exit 1
+}
+
+cmd_teardown() {
+    local clean=$1
+    echo "── swiftdeploy teardown ──────────────────────────────"
+    echo "Stopping and removing containers, networks, and volumes..."
+    docker compose down -v || true
+    if [ "$clean" = "true" ]; then
+        echo "Removing generated config files..."
+        rm -f "$NGINX_OUT" "$COMPOSE_OUT"
+        echo "  ✓ Deleted generated configs"
+    fi
+    echo "✅ Teardown complete."
+}
+
+case "$1" in
+    init) cmd_init ;;
+    validate) cmd_validate ;;
+    deploy) cmd_deploy ;;
+    promote) [ -z "$2" ] && { echo "ERROR: specify target mode"; exit 1; }; cmd_promote "$2" ;;
+    teardown) clean="false"; [[ "$*" == *"--clean"* ]] && clean="true"; cmd_teardown "$clean" ;;
+    *) echo "Usage: ./swiftdeploy {init|validate|deploy|promote|teardown} [args]"; exit 1 ;;
+esac
