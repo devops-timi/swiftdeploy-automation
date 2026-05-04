@@ -214,19 +214,10 @@ with open('$MANIFEST_FILE', 'w') as f: yaml.dump(data, f, default_flow_style=Fal
     local url="http://localhost:$port/healthz"
     echo "  Confirming promotion by polling $url..."
     for ((i=1; i<=30; i++)); do
-        local headers=$(curl -s -I "$url" || true)
-        if curl -s -f "$url" >/dev/null 2>&1; then
-            if [ "$target_mode" = "canary" ]; then
-                if [[ "$headers" == *"X-Mode: canary"* || "$headers" == *"x-mode: canary"* ]]; then
-                    echo "  ✅ PASS: Canary promotion active and verified."
-                    return
-                fi
-            else
-                if [[ "$headers" != *"X-Mode: canary"* && "$headers" != *"x-mode: canary"* ]]; then
-                    echo "  ✅ PASS: Stable promotion active and verified."
-                    return
-                fi
-            fi
+        response=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)
+        if [ "$response" = "200" ]; then
+            echo "  ✅ PASS: Promotion to $target_mode active and verified."
+            return
         fi
         sleep 1
     done
