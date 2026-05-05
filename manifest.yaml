@@ -14,6 +14,9 @@ nginx:
   port: 8080                          # The port Nginx exposes to the OUTSIDE world
   proxy_timeout: 30                   # How many seconds Nginx waits before giving up
   
+opa:
+  image: openpolicyagent/opa:latest
+  port: 8181          # Internal port only — never exposed through nginx
 
 network:
   name: swiftdeploy-net               # Name of the internal Docker network
