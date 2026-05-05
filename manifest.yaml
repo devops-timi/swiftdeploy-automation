@@ -16,7 +16,7 @@ nginx:
   
 opa:
   image: openpolicyagent/opa:latest
-  port: 8181          # Internal port only — never exposed through nginx
+  
 
 network:
   name: swiftdeploy-net               # Name of the internal Docker network
