@@ -317,86 +317,112 @@ for r in deny:
 check_pre_promote() {
     echo -e "\n── OPA Pre-Promote Policy Check ──────────────────────"
 
-    local opa_url
-    opa_url=$(get_opa_url)
-
-    if [ -z "$opa_url" ]; then
-        echo "  ⚠️  WARNING: OPA container not found. Skipping policy check."
-        return 0
-    fi
-
+    local opa_url="http://127.0.0.1:8181"
     local nginx_port
     nginx_port=$(get_val "nginx.port")
     local metrics_url="http://localhost:$nginx_port/metrics"
 
-    # Scrape /metrics and calculate error rate + P99 latency
-    local stats
-    stats=$(curl -s "$metrics_url" --connect-timeout 5 2>/dev/null | python3 -c "
-import sys, re
+    echo "  Sampling metrics over a 30-second window..."
 
-text = sys.stdin.read()
-
-# Parse http_requests_total to get error rate
-# Error = status codes 5xx
-total = 0
-errors = 0
-for line in text.splitlines():
-    m = re.match(r'http_requests_total\{.*status_code=\"(\d+)\".*\}\s+(\d+)', line)
-    if m:
-        code, count = int(m.group(1)), int(m.group(2))
-        total += count
-        if code >= 500:
-            errors += count
-
-error_rate = (errors / total * 100) if total > 0 else 0.0
-
-# Parse histogram to estimate P99 latency
-# P99 = 99th percentile — 99% of requests completed within this time
-buckets = []
-for line in text.splitlines():
-    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"([0-9.]+)\".*\}\s+(\d+)', line)
-    if m and m.group(1) != '+Inf':
-        buckets.append((float(m.group(1)), int(m.group(2))))
-
-# Get total request count from +Inf bucket
-total_reqs = 0
-for line in text.splitlines():
-    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"\+Inf\".*\}\s+(\d+)', line)
-    if m:
-        total_reqs = max(total_reqs, int(m.group(1)))
-
-p99_ms = 0.0
-if buckets and total_reqs > 0:
-    target = total_reqs * 0.99   # 99% of requests
-    for le, count in sorted(buckets):
-        if count >= target:
-            p99_ms = le * 1000   # convert seconds to milliseconds
-            break
-    else:
-        p99_ms = buckets[-1][0] * 1000  # use highest bucket if target not reached
-
-print(f'{error_rate:.4f} {p99_ms:.2f}')
-" 2>/dev/null)
-
-    if [ -z "$stats" ]; then
-        echo "  ⚠️  WARNING: Could not scrape /metrics. Skipping policy check."
+    # Take first snapshot
+    local snap1
+    snap1=$(curl -s "$metrics_url" --connect-timeout 5 2>/dev/null)
+    if [ -z "$snap1" ]; then
+        echo "  ⚠️  WARNING: Could not scrape /metrics. Skipping."
         return 0
     fi
 
-    local error_rate p99_ms
-    error_rate=$(echo "$stats" | awk '{print $1}')
-    p99_ms=$(echo "$stats" | awk '{print $2}')
+    sleep 30
 
-    echo "  Metrics: Error rate=${error_rate}%, P99 latency=${p99_ms}ms"
+    # Take second snapshot
+    local snap2
+    snap2=$(curl -s "$metrics_url" --connect-timeout 5 2>/dev/null)
+    if [ -z "$snap2" ]; then
+        echo "  ⚠️  WARNING: Could not scrape second /metrics snapshot. Skipping."
+        return 0
+    fi
 
+    export SNAP1="$snap1"
+    export SNAP2="$snap2"
+
+    local stats
+    stats=$(python3 -c "
+import re, os
+
+def parse_requests(text):
+    totals = {}
+    buckets = []
+    total_reqs = 0
+    for line in text.splitlines():
+        m = re.match(r'http_requests_total\{.*status_code=\"(\d+)\".*\}\s+(\d+)', line)
+        if m:
+            code, count = int(m.group(1)), int(m.group(2))
+            totals[code] = totals.get(code, 0) + count
+        m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"([0-9.]+)\".*\}\s+(\d+)', line)
+        if m:
+            buckets.append((float(m.group(1)), int(m.group(2))))
+        m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"\+Inf\".*\}\s+(\d+)', line)
+        if m:
+            total_reqs = max(total_reqs, int(m.group(1)))
+    return totals, buckets, total_reqs
+
+snap1 = os.environ.get('SNAP1', '')
+snap2 = os.environ.get('SNAP2', '')
+
+totals1, buckets1, total1 = parse_requests(snap1)
+totals2, buckets2, total2 = parse_requests(snap2)
+
+delta_total  = sum(totals2.values()) - sum(totals1.values())
+delta_errors = sum(v for k, v in totals2.items() if k >= 500) - \
+               sum(v for k, v in totals1.items() if k >= 500)
+delta_reqs   = total2 - total1
+
+# Send as percentage to match data.json max_error_rate_percent
+error_rate_percent = (delta_errors / delta_total * 100) if delta_total > 0 else 0.0
+
+p99_ms = 0.0
+if buckets2 and delta_reqs > 0:
+    target = delta_reqs * 0.99
+    b1_map = {le: cnt for le, cnt in buckets1}
+    b2_map = {le: cnt for le, cnt in buckets2}
+    delta_buckets = sorted([
+        (le, b2_map.get(le, 0) - b1_map.get(le, 0))
+        for le, _ in buckets2
+    ])
+    for le, count in delta_buckets:
+        if count >= target:
+            p99_ms = le * 1000
+            break
+    else:
+        p99_ms = delta_buckets[-1][0] * 1000 if delta_buckets else 0.0
+
+print(f'{error_rate_percent:.4f} {p99_ms:.2f} {delta_total} {delta_errors}')
+" 2>/dev/null)
+
+    unset SNAP1 SNAP2
+
+    if [ -z "$stats" ]; then
+        echo "  ⚠️  WARNING: Could not calculate metrics delta. Skipping."
+        return 0
+    fi
+
+    local error_rate_percent p99_ms delta_total delta_errors
+    error_rate_percent=$(echo "$stats" | awk '{print $1}')
+    p99_ms=$(echo "$stats"             | awk '{print $2}')
+    delta_total=$(echo "$stats"        | awk '{print $3}')
+    delta_errors=$(echo "$stats"       | awk '{print $4}')
+
+    echo "  Last 30s: ${delta_total} requests, ${delta_errors} errors"
+    echo "  Error rate: ${error_rate_percent}%, P99 latency: ${p99_ms}ms"
+
+    # Send error_rate_percent to match data.json key max_error_rate_percent
     local input_json
     input_json=$(python3 -c "
 import json
 print(json.dumps({
     'input': {
-        'error_rate_percent': float('$error_rate'),
-        'p99_latency_ms': float('$p99_ms'),
-        'check_type': 'pre_promote'
+        'error_rate_percent': float('$error_rate_percent'),
+        'p99_latency_ms': float('$p99_ms')
     }
 }))
 ")
@@ -408,43 +434,37 @@ print(json.dumps({
         -d "$input_json" \
         --connect-timeout 5 2>/dev/null)
 
-    local http_code body allowed reasons
+    local http_code body
     http_code=$(echo "$response" | tail -1)
-    body=$(echo "$response" | head -1)
+    body=$(echo "$response"      | head -1)
 
-    if [ "$http_code" = "000" ]; then
-        echo "  ⚠️  WARNING: Cannot connect to OPA. Network error."
+    if [ "$http_code" = "000" ] || [ "$http_code" != "200" ]; then
+        echo "  ⚠️  WARNING: OPA unreachable (Code: $http_code). Skipping."
         return 0
     fi
 
-    if [ "$http_code" != "200" ]; then
-        echo "  ⚠️  WARNING: OPA returned HTTP $http_code. Skipping."
-        return 0
-    fi
-
+    local allowed reasons
     allowed=$(echo "$body" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-result = data.get('result', {})
-print('true' if result.get('allow', False) else 'false')
+print('true' if data.get('result', {}).get('allow', False) else 'false')
 ")
 
     reasons=$(echo "$body" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-result = data.get('result', {})
-deny = result.get('deny', [])
+deny = data.get('result', {}).get('deny', [])
 for r in deny:
     print(f'    ↳ {r}')
 ")
 
     if [ "$allowed" = "true" ]; then
         echo "  ✅ PASS: Canary policy approved promotion"
-        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"pass\",\"error_rate\":$error_rate,\"p99_ms\":$p99_ms}"
+        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"pass\",\"error_rate_percent\":$error_rate_percent,\"p99_ms\":$p99_ms,\"window_seconds\":30}"
     else
         echo "  ❌ BLOCK: Canary policy denied promotion"
         echo "$reasons"
-        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"fail\",\"error_rate\":$error_rate,\"p99_ms\":$p99_ms}"
+        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"fail\",\"error_rate_percent\":$error_rate_percent,\"p99_ms\":$p99_ms,\"window_seconds\":30}"
         return 1
     fi
 }
