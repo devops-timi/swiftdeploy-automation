@@ -14,7 +14,7 @@ allow if {
 deny contains reason if {
     input.error_rate_percent > data.canary.max_error_rate_percent
     reason := sprintf(
-        "Error rate %.2f%% exceeds maximum %.2f%%",
+        "Error rate %.2f%% exceeds maximum %.2f%% over last 30s",
         [input.error_rate_percent, data.canary.max_error_rate_percent]
     )
 }
@@ -23,7 +23,7 @@ deny contains reason if {
 deny contains reason if {
     input.p99_latency_ms > data.canary.max_p99_latency_ms
     reason := sprintf(
-        "P99 latency %.0fms exceeds maximum %.0fms",
+        "P99 latency %.0fms exceeds maximum %.0fms over last 30s",
         [input.p99_latency_ms, data.canary.max_p99_latency_ms]
     )
 }
