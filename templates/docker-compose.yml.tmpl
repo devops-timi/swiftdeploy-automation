@@ -109,6 +109,9 @@ services:
       # Mount the policies/ directory read-only into the container
       - ./policies:/policies:ro
 
+    ports:
+      - "8181:8181"     # Exposed to host so CLI can reach it via 127.0.0.1:8181
+
     networks:
       - {{NETWORK_NAME}}    # Same internal network as app and nginx
 
