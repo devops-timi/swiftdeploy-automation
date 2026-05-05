@@ -88,6 +88,43 @@ services:
       app:
         condition: service_healthy   # Wait for app's healthcheck to pass
 
+  # ── OPA Policy Engine ────────────────────────────────────────────────────
+  # OPA runs as a sidecar — reachable by the CLI but NOT through nginx.
+  # It loads all .rego files from the policies/ directory at startup.
+  # The CLI queries it directly on port 8181 via the internal network.
+  opa:
+
+    image: openpolicyagent/opa:latest
+    # Start OPA in server mode and load all policies + data from /policies
+
+    command:
+      - "run"
+      - "--server"           # Run as HTTP server
+      - "--addr=0.0.0.0:8181"  # Listen on all interfaces inside container
+      - "--log-level=error"  # Only log errors, keep output clean
+      - "/policies"          # Load all .rego files and data.json from here
+
+    volumes:
+
+      # Mount the policies/ directory read-only into the container
+      - ./policies:/policies:ro
+
+    networks:
+      - {{NETWORK_NAME}}    # Same internal network as app and nginx
+
+    restart: {{RESTART_POLICY}}
+
+    # IMPORTANT: No "ports:" section here.
+    # OPA is intentionally NOT exposed to the host.
+    # The CLI reaches it via Docker network on port 8181.
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8181/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
 
 # Volumes persist data even when containers are removed.
 
