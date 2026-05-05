@@ -23,7 +23,7 @@ deny contains reason if {
 deny contains reason if {
     input.p99_latency_ms > data.canary.max_p99_latency_ms
     reason := sprintf(
-        "P99 latency %.0fms exceeds maximum %.0fms over last 30s",
+        "P99 latency %.0fms exceeds maximum %.dms over last 30s",
         [input.p99_latency_ms, data.canary.max_p99_latency_ms]
     )
 }
