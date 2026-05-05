@@ -6,8 +6,12 @@ NGINX_TEMPLATE="templates/nginx.conf.tmpl"
 COMPOSE_TEMPLATE="templates/docker-compose.yml.tmpl"
 NGINX_OUT="nginx.conf"
 COMPOSE_OUT="docker-compose.yml"
+HISTORY_FILE="history.jsonl"
 
-# Helper to read manifest fields using inline Python
+# ─────────────────────────────────────────────
+# Helper: read a value from manifest.yaml
+# Usage: get_val "services.port"
+# ─────────────────────────────────────────────
 get_val() {
     python3 -c "
 import yaml
@@ -24,13 +28,45 @@ except:
 "
 }
 
-# Helper to check if a port is in use
+# ─────────────────────────────────────────────
+# Helper: check if a port is already in use
+# ─────────────────────────────────────────────
 port_in_use() {
     local port=$1
     nc -z -w1 127.0.0.1 "$port" >/dev/null 2>&1 || lsof -i:"$port" >/dev/null 2>&1
 }
 
-# Python-driven template parsing to completely avoid shell variable substitution issues
+# ─────────────────────────────────────────────
+# Helper: get OPA container IP on the Docker network
+# OPA is not exposed to the host, so we reach it via Docker network
+# ─────────────────────────────────────────────
+get_opa_url() {
+    # Get the IP of the OPA container on the swiftdeploy network
+    local opa_ip
+    opa_ip=$(docker inspect swiftdeploy-opa-1 \
+        --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+    if [ -z "$opa_ip" ]; then
+        echo ""
+        return
+    fi
+    echo "http://$opa_ip:8181"
+}
+
+# ─────────────────────────────────────────────
+# Helper: write an event to history.jsonl
+# Every deploy, promote, chaos event is recorded here
+# ─────────────────────────────────────────────
+log_history() {
+    local event_type=$1   # e.g. "deploy", "promote", "policy_violation"
+    local details=$2      # JSON string with extra info
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "{\"timestamp\":\"$timestamp\",\"event\":\"$event_type\",\"details\":$details}" >> "$HISTORY_FILE"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: init
+# ════════════════════════════════════════════════════════════════════════════
 cmd_init() {
     echo "── swiftdeploy init ──────────────────────────────────"
     if [ ! -f "$MANIFEST_FILE" ]; then
@@ -38,56 +74,50 @@ cmd_init() {
         exit 1
     fi
 
-    # Render template files safely using inline Python
     python3 -c "
 import yaml
 
 with open('$MANIFEST_FILE', 'r') as f:
     cfg = yaml.safe_load(f)
 
-# Extraction and safe fallback defaults
 services = cfg.get('services', {})
-nginx = cfg.get('nginx', {})
-network = cfg.get('network', {})
+nginx    = cfg.get('nginx', {})
+network  = cfg.get('network', {})
 
-image = services.get('image', '')
-app_port = str(services.get('port', ''))
-mode = services.get('mode', 'stable')
-version = services.get('version', '1.0.0')
-restart = services.get('restart', 'unless-stopped')
+image          = services.get('image', '')
+app_port       = str(services.get('port', ''))
+mode           = services.get('mode', 'stable')
+version        = services.get('version', '1.0.0')
+restart        = services.get('restart', 'unless-stopped')
+nginx_image    = nginx.get('image', 'nginx:latest')
+nginx_port     = str(nginx.get('port', ''))
+proxy_timeout  = str(nginx.get('proxy_timeout', '30'))
+net_name       = network.get('name', '')
+net_driver     = network.get('driver_type', 'bridge')
+contact        = cfg.get('contact', 'admin@swiftdeploy.local')
 
-nginx_image = nginx.get('image', 'nginx:latest')
-nginx_port = str(nginx.get('port', ''))
-proxy_timeout = str(nginx.get('proxy_timeout', '30'))
-
-net_name = network.get('name', '')
-net_driver = network.get('driver_type', 'bridge')
-contact = cfg.get('contact', 'admin@swiftdeploy.local')
-
-# Process Nginx Template safely
 with open('$NGINX_TEMPLATE', 'r') as f:
     nginx_conf = f.read()
 
-nginx_conf = nginx_conf.replace('{{NGINX_PORT}}', nginx_port) \\
-                       .replace('{{PROXY_TIMEOUT}}', proxy_timeout) \\
-                       .replace('{{APP_PORT}}', app_port) \\
+nginx_conf = nginx_conf.replace('{{NGINX_PORT}}', nginx_port) \
+                       .replace('{{PROXY_TIMEOUT}}', proxy_timeout) \
+                       .replace('{{APP_PORT}}', app_port) \
                        .replace('{{CONTACT}}', contact)
 
 with open('$NGINX_OUT', 'w') as f:
     f.write(nginx_conf)
 
-# Process Docker Compose Template safely
 with open('$COMPOSE_TEMPLATE', 'r') as f:
     compose = f.read()
 
-compose = compose.replace('{{IMAGE}}', image) \\
-                 .replace('{{MODE}}', mode) \\
-                 .replace('{{APP_VERSION}}', version) \\
-                 .replace('{{APP_PORT}}', app_port) \\
-                 .replace('{{NGINX_IMAGE}}', nginx_image) \\
-                 .replace('{{NGINX_PORT}}', nginx_port) \\
-                 .replace('{{NETWORK_NAME}}', net_name) \\
-                 .replace('{{NETWORK_DRIVER}}', net_driver) \\
+compose = compose.replace('{{IMAGE}}', image) \
+                 .replace('{{MODE}}', mode) \
+                 .replace('{{APP_VERSION}}', version) \
+                 .replace('{{APP_PORT}}', app_port) \
+                 .replace('{{NGINX_IMAGE}}', nginx_image) \
+                 .replace('{{NGINX_PORT}}', nginx_port) \
+                 .replace('{{NETWORK_NAME}}', net_name) \
+                 .replace('{{NETWORK_DRIVER}}', net_driver) \
                  .replace('{{RESTART_POLICY}}', restart)
 
 with open('$COMPOSE_OUT', 'w') as f:
@@ -98,11 +128,13 @@ print('  ✓ Generated nginx.conf and docker-compose.yml successfully.')
     echo "── init complete ─────────────────────────────────────"
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: validate
+# ════════════════════════════════════════════════════════════════════════════
 cmd_validate() {
     echo "── swiftdeploy validate ──────────────────────────────"
     local all_passed=true
 
-    # 1. YAML validation check
     echo -e "\n[1/5] Checking manifest.yaml exists and is valid YAML..."
     if [ -f "$MANIFEST_FILE" ]; then
         if python3 -c "import yaml; yaml.safe_load(open('$MANIFEST_FILE'))" >/dev/null 2>&1; then
@@ -116,21 +148,22 @@ cmd_validate() {
         all_passed=false
     fi
 
-    # 2. Field existence check
     echo -e "\n[2/5] Checking required fields..."
     local required=("services.image" "services.port" "nginx.image" "nginx.port" "network.name" "network.driver_type")
+    local fields_ok=true
     for field in "${required[@]}"; do
         val=$(get_val "$field")
         if [ -z "$val" ]; then
             echo "  ❌ FAIL: Missing required field: $field"
             all_passed=false
+            fields_ok=false
         fi
     done
-    if [ "$all_passed" = true ]; then echo "  ✅ PASS: All required fields present"; fi
+    [ "$fields_ok" = true ] && echo "  ✅ PASS: All required fields present"
 
-    # 3. Docker image check
     echo -e "\n[3/5] Checking Docker image exists locally..."
-    local image=$(get_val "services.image")
+    local image
+    image=$(get_val "services.image")
     if [ -n "$image" ] && docker image inspect "$image" >/dev/null 2>&1; then
         echo "  ✅ PASS: Image '$image' found locally"
     else
@@ -138,9 +171,9 @@ cmd_validate() {
         all_passed=false
     fi
 
-    # 4. Port Check
     echo -e "\n[4/5] Checking Nginx port availability..."
-    local port=$(get_val "nginx.port")
+    local port
+    port=$(get_val "nginx.port")
     if [ -n "$port" ] && port_in_use "$port"; then
         echo "  ❌ FAIL: Port $port is already bound on the host."
         all_passed=false
@@ -148,13 +181,15 @@ cmd_validate() {
         echo "  ✅ PASS: Port $port is free on the host"
     fi
 
-    # 5. Nginx Syntax Check
     echo -e "\n[5/5] Validating generated nginx.conf syntax..."
     cmd_init > /dev/null
-    local nginx_image=$(get_val "nginx.image")
+    local nginx_image
+    nginx_image=$(get_val "nginx.image")
     [ -z "$nginx_image" ] && nginx_image="nginx:latest"
 
-    if docker run --rm -v "$(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro" "$nginx_image" nginx -t >/dev/null 2>&1; then
+    if docker run --rm \
+        -v "$(pwd)/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        "$nginx_image" nginx -t >/dev/null 2>&1; then
         echo "  ✅ PASS: nginx.conf is syntactically valid"
     else
         echo "  ❌ FAIL: nginx.conf syntax error detected"
@@ -168,28 +203,294 @@ cmd_validate() {
     echo -e "\n── validation complete: ALL CHECKS PASSED ────────────"
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# OPA POLICY CHECKS
+# These functions query OPA and surface the reasoning to the operator.
+# The CLI never makes allow/deny decisions itself — OPA does.
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Pre-deploy check ────────────────────────────────────────────────────────
+# Gathers host stats and sends them to OPA infrastructure policy.
+# Blocks deployment if disk/CPU/memory thresholds are exceeded.
+check_pre_deploy() {
+    echo -e "\n── OPA Pre-Deploy Policy Check ───────────────────────"
+
+    local opa_url
+    opa_url=$(get_opa_url)
+
+    # Handle OPA unavailable gracefully — warn but don't crash
+    if [ -z "$opa_url" ]; then
+        echo "  ⚠️  WARNING: OPA container not found. Skipping policy check."
+        echo "  ↳ Start the stack first or run with OPA available."
+        return 0
+    fi
+
+    # Gather host statistics
+    # disk_free_gb: free disk space on the root filesystem in GB
+    local disk_free_gb
+    disk_free_gb=$(df -BG / | awk 'NR==2 {gsub("G",""); print $4}')
+
+    # cpu_load: 1-minute load average from /proc/loadavg
+    local cpu_load
+    cpu_load=$(awk '{print $1}' /proc/loadavg)
+
+    # mem_percent: percentage of memory currently in use
+    local mem_percent
+    mem_percent=$(free | awk 'NR==2 {printf "%.1f", $3/$2*100}')
+
+    echo "  Host stats: Disk=${disk_free_gb}GB free, CPU load=${cpu_load}, Mem=${mem_percent}% used"
+
+    # Build the JSON input for OPA
+    # OPA expects: { "input": { ...your data... } }
+    local input_json
+    input_json=$(python3 -c "
+import json
+print(json.dumps({
+    'input': {
+        'disk_free_gb': float('$disk_free_gb'),
+        'cpu_load': float('$cpu_load'),
+        'mem_percent': float('$mem_percent'),
+        'check_type': 'pre_deploy'
+    }
+}))
+")
+
+    # Query OPA infrastructure policy
+    # OPA REST API: POST /v1/data/<package>/<rule>
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -X POST "$opa_url/v1/data/infrastructure" \
+        -H "Content-Type: application/json" \
+        -d "$input_json" \
+        --connect-timeout 5 2>/dev/null)
+
+    local http_code
+    http_code=$(echo "$response" | tail -1)
+    local body
+    body=$(echo "$response" | head -1)
+
+    # Handle different failure modes distinctly
+    if [ "$http_code" = "000" ]; then
+        echo "  ⚠️  WARNING: Cannot connect to OPA. Network error."
+        return 0
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        echo "  ⚠️  WARNING: OPA returned HTTP $http_code. Skipping policy check."
+        return 0
+    fi
+
+    # Parse OPA response
+    # OPA returns: { "result": { "allow": true/false, "deny": [...reasons...] } }
+    local allowed
+    allowed=$(echo "$body" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+result = data.get('result', {})
+print('true' if result.get('allow', False) else 'false')
+")
+
+    local reasons
+    reasons=$(echo "$body" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+result = data.get('result', {})
+deny = result.get('deny', [])
+for r in deny:
+    print(f'    ↳ {r}')
+")
+
+    if [ "$allowed" = "true" ]; then
+        echo "  ✅ PASS: Infrastructure policy approved deployment"
+        log_history "policy_check" "{\"policy\":\"infrastructure\",\"result\":\"pass\"}"
+    else
+        echo "  ❌ BLOCK: Infrastructure policy denied deployment"
+        echo "$reasons"
+        log_history "policy_check" "{\"policy\":\"infrastructure\",\"result\":\"fail\",\"reasons\":$(echo "$body" | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin).get('result',{}).get('deny',[])))")}"
+        return 1
+    fi
+}
+
+# ── Pre-promote check ───────────────────────────────────────────────────────
+# Scrapes /metrics, calculates error rate and P99 latency,
+# sends them to OPA canary policy. Blocks promotion if unhealthy.
+check_pre_promote() {
+    echo -e "\n── OPA Pre-Promote Policy Check ──────────────────────"
+
+    local opa_url
+    opa_url=$(get_opa_url)
+
+    if [ -z "$opa_url" ]; then
+        echo "  ⚠️  WARNING: OPA container not found. Skipping policy check."
+        return 0
+    fi
+
+    local nginx_port
+    nginx_port=$(get_val "nginx.port")
+    local metrics_url="http://localhost:$nginx_port/metrics"
+
+    # Scrape /metrics and calculate error rate + P99 latency
+    local stats
+    stats=$(curl -s "$metrics_url" --connect-timeout 5 2>/dev/null | python3 -c "
+import sys, re
+
+text = sys.stdin.read()
+
+# Parse http_requests_total to get error rate
+# Error = status codes 5xx
+total = 0
+errors = 0
+for line in text.splitlines():
+    m = re.match(r'http_requests_total\{.*status_code=\"(\d+)\".*\}\s+(\d+)', line)
+    if m:
+        code, count = int(m.group(1)), int(m.group(2))
+        total += count
+        if code >= 500:
+            errors += count
+
+error_rate = (errors / total * 100) if total > 0 else 0.0
+
+# Parse histogram to estimate P99 latency
+# P99 = 99th percentile — 99% of requests completed within this time
+buckets = []
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"([0-9.]+)\".*\}\s+(\d+)', line)
+    if m and m.group(1) != '+Inf':
+        buckets.append((float(m.group(1)), int(m.group(2))))
+
+# Get total request count from +Inf bucket
+total_reqs = 0
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"\+Inf\".*\}\s+(\d+)', line)
+    if m:
+        total_reqs = max(total_reqs, int(m.group(1)))
+
+p99_ms = 0.0
+if buckets and total_reqs > 0:
+    target = total_reqs * 0.99   # 99% of requests
+    for le, count in sorted(buckets):
+        if count >= target:
+            p99_ms = le * 1000   # convert seconds to milliseconds
+            break
+    else:
+        p99_ms = buckets[-1][0] * 1000  # use highest bucket if target not reached
+
+print(f'{error_rate:.4f} {p99_ms:.2f}')
+" 2>/dev/null)
+
+    if [ -z "$stats" ]; then
+        echo "  ⚠️  WARNING: Could not scrape /metrics. Skipping policy check."
+        return 0
+    fi
+
+    local error_rate p99_ms
+    error_rate=$(echo "$stats" | awk '{print $1}')
+    p99_ms=$(echo "$stats" | awk '{print $2}')
+
+    echo "  Metrics: Error rate=${error_rate}%, P99 latency=${p99_ms}ms"
+
+    local input_json
+    input_json=$(python3 -c "
+import json
+print(json.dumps({
+    'input': {
+        'error_rate_percent': float('$error_rate'),
+        'p99_latency_ms': float('$p99_ms'),
+        'check_type': 'pre_promote'
+    }
+}))
+")
+
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -X POST "$opa_url/v1/data/canary" \
+        -H "Content-Type: application/json" \
+        -d "$input_json" \
+        --connect-timeout 5 2>/dev/null)
+
+    local http_code body allowed reasons
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | head -1)
+
+    if [ "$http_code" = "000" ]; then
+        echo "  ⚠️  WARNING: Cannot connect to OPA. Network error."
+        return 0
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        echo "  ⚠️  WARNING: OPA returned HTTP $http_code. Skipping."
+        return 0
+    fi
+
+    allowed=$(echo "$body" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+result = data.get('result', {})
+print('true' if result.get('allow', False) else 'false')
+")
+
+    reasons=$(echo "$body" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+result = data.get('result', {})
+deny = result.get('deny', [])
+for r in deny:
+    print(f'    ↳ {r}')
+")
+
+    if [ "$allowed" = "true" ]; then
+        echo "  ✅ PASS: Canary policy approved promotion"
+        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"pass\",\"error_rate\":$error_rate,\"p99_ms\":$p99_ms}"
+    else
+        echo "  ❌ BLOCK: Canary policy denied promotion"
+        echo "$reasons"
+        log_history "policy_check" "{\"policy\":\"canary\",\"result\":\"fail\",\"error_rate\":$error_rate,\"p99_ms\":$p99_ms}"
+        return 1
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: deploy (now gated by OPA)
+# ════════════════════════════════════════════════════════════════════════════
 cmd_deploy() {
-    cmd_init >/dev/null
+    cmd_init > /dev/null
     cmd_validate
+
     echo -e "\n── swiftdeploy deploy ────────────────────────────────"
     echo "Bringing up the stack via Docker Compose..."
     docker compose up -d
 
-    local port=$(get_val "nginx.port")
+    local port
+    port=$(get_val "nginx.port")
     local url="http://localhost:$port/healthz"
     echo "Polling health endpoint $url (up to 60 seconds)..."
+
     for ((i=1; i<=60; i++)); do
         if curl -s -f "$url" >/dev/null 2>&1; then
-            echo "  ✅ PASS: Service is online and healthy!"
-            return
+            echo "  ✅ Stack is healthy!"
+            break
         fi
         sleep 1
+        if [ "$i" = "60" ]; then
+            echo "  ❌ FAIL: Health check timed out."
+            exit 1
+        fi
     done
 
-    echo "  ❌ FAIL: Service failed health check within 60s timeout."
-    exit 1
+    # Now run pre-deploy OPA check (after stack is up so OPA is available)
+    check_pre_deploy || {
+        echo -e "\n❌ Deployment blocked by policy. Running teardown..."
+        docker compose down -v
+        exit 1
+    }
+
+    log_history "deploy" "{\"mode\":\"$(get_val 'services.mode')\"}"
+    echo -e "\n✅ Deploy complete. Access at: http://localhost:$port"
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: promote (now gated by OPA)
+# ════════════════════════════════════════════════════════════════════════════
 cmd_promote() {
     local target_mode=$1
     if [[ "$target_mode" != "stable" && "$target_mode" != "canary" ]]; then
@@ -198,6 +499,14 @@ cmd_promote() {
     fi
 
     echo "── swiftdeploy promote: $target_mode ─────────────────"
+
+    # Run pre-promote OPA check before switching anything
+    check_pre_promote || {
+        echo -e "\n❌ Promotion blocked by policy."
+        exit 1
+    }
+
+    # Update mode in manifest.yaml preserving comments
     python3 -c "
 import re
 with open('$MANIFEST_FILE', 'r') as f:
@@ -207,26 +516,352 @@ with open('$MANIFEST_FILE', 'w') as f:
     f.write(content)
 "
     echo "  ✓ Updated $MANIFEST_FILE to $target_mode"
+
     cmd_init > /dev/null
 
     echo "  Recreating app container only..."
     docker compose up -d --no-deps --force-recreate app
 
-    local port=$(get_val "nginx.port")
+    local port
+    port=$(get_val "nginx.port")
     local url="http://localhost:$port/healthz"
     echo "  Confirming promotion by polling $url..."
+
     for ((i=1; i<=30; i++)); do
         response=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)
         if [ "$response" = "200" ]; then
             echo "  ✅ PASS: Promotion to $target_mode active and verified."
+            log_history "promote" "{\"mode\":\"$target_mode\"}"
             return
         fi
         sleep 1
     done
+
     echo "  ❌ FAIL: Promotion verification timed out."
     exit 1
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: status (live dashboard)
+# Scrapes /metrics every 5 seconds and shows policy compliance
+# ════════════════════════════════════════════════════════════════════════════
+cmd_status() {
+    echo "── swiftdeploy status (Ctrl+C to exit) ──────────────"
+
+    local port
+    port=$(get_val "nginx.port")
+    local metrics_url="http://localhost:$port/metrics"
+
+    while true; do
+        # Clear screen for live refresh
+        clear
+        echo "══════════════════════════════════════════════════════"
+        echo "  SwiftDeploy Status Dashboard"
+        echo "  $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo "══════════════════════════════════════════════════════"
+
+        # Scrape metrics
+        local raw_metrics
+        raw_metrics=$(curl -s "$metrics_url" --connect-timeout 3 2>/dev/null)
+
+        if [ -z "$raw_metrics" ]; then
+            echo "  ⚠️  Cannot reach $metrics_url"
+        else
+            # Parse and display metrics using Python
+            echo "$raw_metrics" | python3 -c "
+import sys, re, json
+from datetime import datetime, timezone
+
+text = sys.stdin.read()
+
+# Parse request totals
+total, errors = 0, 0
+by_path = {}
+for line in text.splitlines():
+    m = re.match(r'http_requests_total\{.*method=\"(\w+)\".*path=\"([^\"]+)\".*status_code=\"(\d+)\".*\}\s+(\d+)', line)
+    if m:
+        method, path, code, count = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+        total += count
+        if code >= 500:
+            errors += count
+        key = f'{method} {path}'
+        by_path[key] = by_path.get(key, 0) + count
+
+error_rate = (errors / total * 100) if total > 0 else 0.0
+
+# Parse P99 latency
+buckets = []
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"([0-9.]+)\".*\}\s+(\d+)', line)
+    if m:
+        buckets.append((float(m.group(1)), int(m.group(2))))
+
+total_reqs = 0
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"\+Inf\".*\}\s+(\d+)', line)
+    if m:
+        total_reqs = max(total_reqs, int(m.group(1)))
+
+p99_ms = 0.0
+if buckets and total_reqs > 0:
+    target = total_reqs * 0.99
+    for le, count in sorted(buckets):
+        if count >= target:
+            p99_ms = le * 1000
+            break
+
+# Parse gauges
+uptime, mode_val, chaos_val = 0, 0, 0
+for line in text.splitlines():
+    if line.startswith('app_uptime_seconds '):
+        uptime = float(line.split()[1])
+    if line.startswith('app_mode '):
+        mode_val = int(line.split()[1])
+    if line.startswith('chaos_active '):
+        chaos_val = int(line.split()[1])
+
+mode_str   = 'canary' if mode_val == 1 else 'stable'
+chaos_str  = ['none', 'slow', 'error'][chaos_val]
+
+print(f'  Mode:        {mode_str}')
+print(f'  Uptime:      {uptime:.0f}s')
+print(f'  Chaos:       {chaos_str}')
+print()
+print(f'  Total reqs:  {total}')
+print(f'  Error rate:  {error_rate:.2f}%')
+print(f'  P99 latency: {p99_ms:.0f}ms')
+print()
+print('  Requests by endpoint:')
+for path, count in by_path.items():
+    print(f'    {path}: {count}')
+
+# Write to history.jsonl
+entry = {
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'event': 'metrics_scrape',
+    'details': {
+        'mode': mode_str,
+        'chaos': chaos_str,
+        'total_requests': total,
+        'error_rate_percent': round(error_rate, 4),
+        'p99_latency_ms': round(p99_ms, 2),
+        'uptime': uptime
+    }
+}
+with open('history.jsonl', 'a') as f:
+    f.write(json.dumps(entry) + '\n')
+"
+        fi
+
+        # Policy compliance section
+        echo ""
+        echo "  Policy Compliance:"
+        local opa_url
+        opa_url=$(get_opa_url 2>/dev/null)
+
+        if [ -z "$opa_url" ]; then
+            echo "    ⚠️  OPA unavailable"
+        else
+            # Check infrastructure policy
+            local disk_free cpu_load mem_percent
+            disk_free=$(df -BG / | awk 'NR==2 {gsub("G",""); print $4}')
+            cpu_load=$(awk '{print $1}' /proc/loadavg)
+            mem_percent=$(free | awk 'NR==2 {printf "%.1f", $3/$2*100}')
+
+            local infra_input
+            infra_input=$(python3 -c "import json; print(json.dumps({'input':{'disk_free_gb':float('$disk_free'),'cpu_load':float('$cpu_load'),'mem_percent':float('$mem_percent'),'check_type':'status'}}))")
+
+            local infra_resp
+            infra_resp=$(curl -s -X POST "$opa_url/v1/data/infrastructure" \
+                -H "Content-Type: application/json" \
+                -d "$infra_input" --connect-timeout 3 2>/dev/null)
+
+            local infra_ok
+            infra_ok=$(echo "$infra_resp" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('true' if d.get('result',{}).get('allow',False) else 'false')
+" 2>/dev/null)
+
+            if [ "$infra_ok" = "true" ]; then
+                echo "    ✅ infrastructure: PASS (disk=${disk_free}GB, cpu=${cpu_load}, mem=${mem_percent}%)"
+            else
+                echo "    ❌ infrastructure: FAIL (disk=${disk_free}GB, cpu=${cpu_load}, mem=${mem_percent}%)"
+            fi
+
+            # Check canary policy if metrics are available
+            if [ -n "$raw_metrics" ]; then
+                local stats
+                stats=$(echo "$raw_metrics" | python3 -c "
+import sys, re
+text = sys.stdin.read()
+total, errors = 0, 0
+for line in text.splitlines():
+    m = re.match(r'http_requests_total\{.*status_code=\"(\d+)\".*\}\s+(\d+)', line)
+    if m:
+        code, count = int(m.group(1)), int(m.group(2))
+        total += count
+        if code >= 500: errors += count
+error_rate = (errors / total * 100) if total > 0 else 0.0
+buckets = []
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"([0-9.]+)\".*\}\s+(\d+)', line)
+    if m: buckets.append((float(m.group(1)), int(m.group(2))))
+total_reqs = 0
+for line in text.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{.*le=\"\+Inf\".*\}\s+(\d+)', line)
+    if m: total_reqs = max(total_reqs, int(m.group(1)))
+p99_ms = 0.0
+if buckets and total_reqs > 0:
+    target = total_reqs * 0.99
+    for le, count in sorted(buckets):
+        if count >= target:
+            p99_ms = le * 1000
+            break
+print(f'{error_rate:.4f} {p99_ms:.2f}')
+" 2>/dev/null)
+                local er p99
+                er=$(echo "$stats" | awk '{print $1}')
+                p99=$(echo "$stats" | awk '{print $2}')
+
+                local canary_input
+                canary_input=$(python3 -c "import json; print(json.dumps({'input':{'error_rate_percent':float('$er'),'p99_latency_ms':float('$p99'),'check_type':'status'}}))")
+
+                local canary_resp
+                canary_resp=$(curl -s -X POST "$opa_url/v1/data/canary" \
+                    -H "Content-Type: application/json" \
+                    -d "$canary_input" --connect-timeout 3 2>/dev/null)
+
+                local canary_ok
+                canary_ok=$(echo "$canary_resp" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('true' if d.get('result',{}).get('allow',False) else 'false')
+" 2>/dev/null)
+
+                if [ "$canary_ok" = "true" ]; then
+                    echo "    ✅ canary: PASS (error=${er}%, p99=${p99}ms)"
+                else
+                    echo "    ❌ canary: FAIL (error=${er}%, p99=${p99}ms)"
+                fi
+            fi
+        fi
+
+        echo ""
+        echo "  Refreshing in 5s... (Ctrl+C to exit)"
+        sleep 5
+    done
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: audit
+# Reads history.jsonl and generates audit_report.md
+# ════════════════════════════════════════════════════════════════════════════
+cmd_audit() {
+    echo "── swiftdeploy audit ─────────────────────────────────"
+
+    if [ ! -f "$HISTORY_FILE" ]; then
+        echo "No history found. Run the stack first."
+        exit 1
+    fi
+
+    python3 -c "
+import json
+from datetime import datetime
+
+entries = []
+with open('$HISTORY_FILE', 'r') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except:
+                pass
+
+lines = []
+lines.append('# SwiftDeploy Audit Report')
+lines.append(f'')
+lines.append(f'Generated: {datetime.utcnow().strftime(\"%Y-%m-%dT%H:%M:%SZ\")}')
+lines.append(f'Total events: {len(entries)}')
+lines.append('')
+
+# Timeline table
+lines.append('## Timeline')
+lines.append('')
+lines.append('| Timestamp | Event | Details |')
+lines.append('|-----------|-------|---------|')
+
+for e in entries:
+    ts    = e.get('timestamp', '')
+    event = e.get('event', '')
+    det   = e.get('details', {})
+
+    # Format details nicely based on event type
+    if event == 'deploy':
+        detail_str = f'mode={det.get(\"mode\", \"\")}'
+    elif event == 'promote':
+        detail_str = f'→ {det.get(\"mode\", \"\")}'
+    elif event == 'policy_check':
+        result = det.get('result', '')
+        policy = det.get('policy', '')
+        detail_str = f'{policy}: {result}'
+    elif event == 'metrics_scrape':
+        detail_str = f'err={det.get(\"error_rate_percent\",0):.2f}% p99={det.get(\"p99_latency_ms\",0):.0f}ms chaos={det.get(\"chaos\",\"none\")}'
+    else:
+        detail_str = str(det)[:60]
+
+    lines.append(f'| {ts} | {event} | {detail_str} |')
+
+lines.append('')
+
+# Violations section
+lines.append('## Policy Violations')
+lines.append('')
+
+violations = [e for e in entries
+              if e.get('event') == 'policy_check'
+              and e.get('details', {}).get('result') == 'fail']
+
+if not violations:
+    lines.append('No policy violations recorded.')
+else:
+    lines.append('| Timestamp | Policy | Reasons |')
+    lines.append('|-----------|--------|---------|')
+    for v in violations:
+        ts     = v.get('timestamp', '')
+        policy = v.get('details', {}).get('policy', '')
+        reasons = v.get('details', {}).get('reasons', [])
+        reason_str = '; '.join(reasons) if reasons else 'see logs'
+        lines.append(f'| {ts} | {policy} | {reason_str} |')
+
+lines.append('')
+
+# Mode changes section
+lines.append('## Mode Changes')
+lines.append('')
+promotes = [e for e in entries if e.get('event') == 'promote']
+if not promotes:
+    lines.append('No mode changes recorded.')
+else:
+    lines.append('| Timestamp | New Mode |')
+    lines.append('|-----------|----------|')
+    for p in promotes:
+        ts   = p.get('timestamp', '')
+        mode = p.get('details', {}).get('mode', '')
+        lines.append(f'| {ts} | {mode} |')
+
+with open('audit_report.md', 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+
+print('  ✓ audit_report.md generated successfully.')
+"
+    echo "── audit complete ────────────────────────────────────"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: teardown
+# ════════════════════════════════════════════════════════════════════════════
 cmd_teardown() {
     local clean=$1
     echo "── swiftdeploy teardown ──────────────────────────────"
@@ -237,14 +872,30 @@ cmd_teardown() {
         rm -f "$NGINX_OUT" "$COMPOSE_OUT"
         echo "  ✓ Deleted generated configs"
     fi
+    log_history "teardown" "{}" 2>/dev/null || true
     echo "✅ Teardown complete."
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# MAIN — route subcommands
+# ════════════════════════════════════════════════════════════════════════════
 case "$1" in
-    init) cmd_init ;;
+    init)     cmd_init ;;
     validate) cmd_validate ;;
-    deploy) cmd_deploy ;;
-    promote) [ -z "$2" ] && { echo "ERROR: specify target mode"; exit 1; }; cmd_promote "$2" ;;
-    teardown) clean="false"; [[ "$*" == *"--clean"* ]] && clean="true"; cmd_teardown "$clean" ;;
-    *) echo "Usage: ./swiftdeploy {init|validate|deploy|promote|teardown} [args]"; exit 1 ;;
+    deploy)   cmd_deploy ;;
+    promote)
+        [ -z "$2" ] && { echo "ERROR: specify target mode"; exit 1; }
+        cmd_promote "$2"
+        ;;
+    teardown)
+        clean="false"
+        [[ "$*" == *"--clean"* ]] && clean="true"
+        cmd_teardown "$clean"
+        ;;
+    status)   cmd_status ;;
+    audit)    cmd_audit ;;
+    *)
+        echo "Usage: ./swiftdeploy {init|validate|deploy|promote|teardown|status|audit} [args]"
+        exit 1
+        ;;
 esac
